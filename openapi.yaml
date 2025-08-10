@@ -1,0 +1,63 @@
+openapi: 3.1.0
+info:
+  title: CENDOJ Action
+  version: 1.0.0
+  description: API para buscar resoluciones en el CENDOJ (mock de prueba).
+servers:
+  - url: https://cendoj-action.onrender.com
+paths:
+  /health:
+    get:
+      operationId: health
+      summary: Comprobación de estado
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+  /buscar-cendoj:
+    get:
+      operationId: buscarCendoj
+      summary: Buscar Cendoj
+      parameters:
+        - in: query
+          name: query
+          required: true
+          schema:
+            type: string
+          description: Texto de búsqueda (p. ej., "fuera de ordenación").
+      responses:
+        "200":
+          description: Resultados de búsqueda
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  query: { type: string }
+                  total: { type: integer }
+                  resultados:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        titulo: { type: string }
+                        ponente: { type: string }
+                        fecha: { type: string, format: date }
+                        url: { type: string, format: uri }
+              examples:
+                ejemplo:
+                  value:
+                    query: "fuera de ordenación"
+                    total: 1
+                    resultados:
+                      - titulo: "Sentencia ejemplo sobre 'volumen disconforme'"
+                        ponente: "TSJC"
+                        fecha: "2023-05-10"
+                        url: "https://www.poderjudicial.es/search/indexAN.jsp"
