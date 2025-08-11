@@ -1,302 +1,218 @@
-from __future__ import annotations
-
 from datetime import date, datetime
-from typing import List, Optional, Tuple
+from typing import List, Optional, Literal
 
-import unicodedata
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
 
-# -----------------------------------------------------------------------------
-# Utilidades
-# -----------------------------------------------------------------------------
-
-def _norm(text: str) -> str:
-    """Normaliza texto: minúsculas, sin acentos, espacios compactados."""
-    if text is None:
-        return ""
-    text = (
-        unicodedata.normalize("NFKD", text)
-        .encode("ascii", "ignore")
-        .decode("ascii")
-        .lower()
-        .strip()
-    )
-    return " ".join(text.split())
-
-
-def _parse_date(s: Optional[str]) -> Optional[date]:
-    if not s:
-        return None
-    try:
-        return datetime.strptime(s, "%Y-%m-%d").date()
-    except ValueError:
-        raise HTTPException(status_code=400, detail=f"Fecha inválida: '{s}'. Usa YYYY-MM-DD.")
-
-
-# Mapeo de órganos aceptados (normalización ligera)
-ORG_ALIASES = {
-    "ts": "Tribunal Supremo (TS)",
-    "tribunal supremo": "Tribunal Supremo (TS)",
-    "tsjc": "Tribunal Superior de Justicia de Cataluña (TSJC)",
-    "tribunal superior de justicia de cataluna": "Tribunal Superior de Justicia de Cataluña (TSJC)",
-    "tribunal superior de justicia de cataluña": "Tribunal Superior de Justicia de Cataluña (TSJC)",
-    "an": "Audiencia Nacional (AN)",
-    "audiencia nacional": "Audiencia Nacional (AN)",
-}
-
-def _normaliza_organo(valor: Optional[str]) -> Optional[str]:
-    if not valor:
-        return None
-    key = _norm(valor)
-    return ORG_ALIASES.get(key, valor)
-
-
-# Sinónimos básicos para mejorar “recall”
-SYNONYMS = {
-    "fuera de ordenacion": ["situacion de fuera de ordenacion", "edificacion disconforme", "ordenacion urbanistica"],
-    "volumen disconforme": ["alteracion de volumen", "aumento de edificabilidad", "disconformidad con planeamiento"],
-    "suelo no urbanizable": ["suelo rustico", "suelos protegidos", "autorizacion excepcional"],
-    "garaje": ["aparcamiento"],
-}
-
-def _expand_terms(query: str) -> List[str]:
-    terms = set()
-    base = _norm(query)
-    if not base:
-        return []
-    # palabras “clave” de la query (dividir por espacios)
-    tokens = [t for t in base.split() if len(t) > 1]
-    terms.update(tokens)
-
-    # intentamos añadir sinónimos por frase completa
-    if base in SYNONYMS:
-        for s in SYNONYMS[base]:
-            terms.update(_norm(s).split())
-
-    # y también por token
-    for token in tokens:
-        if token in SYNONYMS:
-            for s in SYNONYMS[token]:
-                terms.update(_norm(s).split())
-
-    return list(terms)
-
-
-# -----------------------------------------------------------------------------
-# Datos MOCK (puedes sustituir por tu integrador real cuando esté listo)
-# -----------------------------------------------------------------------------
-MOCK_DATA = [
-    {
-        "id_cendoj": "08019320012023000123",
-        "titulo": "Sentencia ejemplo sobre 'volumen disconforme'",
-        "organo": "Tribunal Superior de Justicia de Cataluña (TSJC)",
-        "sala": "Sala de lo Contencioso-Administrativo",
-        "ponente": "Ponente A",
-        "fecha": "2023-05-10",
-        "relevancia": 0.18,
-        "url": "https://www.poderjudicial.es/search/indexAN.jsp",
-        "url_detalle": "https://www.poderjudicial.es/search/cedula.jsp?id=08019320012023000123",
-        "materia": "urbanismo",
-        "texto": "volumen disconforme edificacion disconforme planeamiento cataluna",
-    },
-    {
-        "id_cendoj": "28079130012022000456",
-        "titulo": "Sentencia ejemplo sobre 'fuera de ordenación' en suelo urbano",
-        "organo": "Tribunal Supremo (TS)",
-        "sala": "Sala Tercera (Cont.-Adm.)",
-        "ponente": "Ponente B",
-        "fecha": "2022-11-03",
-        "relevancia": 0.12,
-        "url": "https://www.poderjudicial.es/search/indexAN.jsp",
-        "url_detalle": "https://www.poderjudicial.es/search/cedula.jsp?id=28079130012022000456",
-        "materia": "urbanismo",
-        "texto": "fuera de ordenacion suelo urbano licencia fuera de ordenacion",
-    },
-    {
-        "id_cendoj": "08019320012024000077",
-        "titulo": "Licencia urbanística en suelo no urbanizable: criterios recientes",
-        "organo": "Tribunal Superior de Justicia de Cataluña (TSJC)",
-        "sala": "Sala de lo Contencioso-Administrativo",
-        "ponente": "Ponente C",
-        "fecha": "2024-02-12",
-        "relevancia": 0.76,
-        "url": "https://www.poderjudicial.es/search/indexAN.jsp",
-        "url_detalle": "https://www.poderjudicial.es/search/cedula.jsp?id=08019320012024000077",
-        "materia": "urbanismo",
-        "texto": "suelo no urbanizable licencia urbanistica autorizacion excepcional",
-    },
-]
-
-def _result_score(item: dict, terms: List[str]) -> float:
-    """Puntuación sencilla por presencia de términos en título + texto."""
-    hay = 0
-    texto_busqueda = _norm(item.get("titulo", "") + " " + item.get("texto", ""))
-    for t in terms:
-        if t in texto_busqueda:
-            hay += 1
-    return hay / max(1, len(terms))
-
-
-# -----------------------------------------------------------------------------
-# Modelos de respuesta (estables para el agente)
-# -----------------------------------------------------------------------------
-
-class CendojItem(BaseModel):
-    id_cendoj: Optional[str] = Field(None, example="08019320012023000123")
-    titulo: str
-    organo: str
-    sala: Optional[str] = None
-    ponente: Optional[str] = None
-    fecha: str = Field(..., regex=r"^\d{4}-\d{2}-\d{2}$")
-    relevancia: Optional[float] = Field(None, ge=0, le=1, description="0.0–1.0 (se mostrará como % en el agente)")
-    url: str
-    url_detalle: Optional[str] = None
-
-    @validator("fecha")
-    def _val_fecha(cls, v: str) -> str:
-        # asegura formato correcto
-        _ = datetime.strptime(v, "%Y-%m-%d")
-        return v
-
-
-class CendojResponse(BaseModel):
-    query: str
-    total: int
-    resultados: List[CendojItem]
-    nota: Optional[str] = None
-
-
-# -----------------------------------------------------------------------------
-# FastAPI
-# -----------------------------------------------------------------------------
+# =============================================================================
+# CENDOJ Action Mock - v1.3 (mejoras 1..5 unificadas)
+# =============================================================================
 
 app = FastAPI(
     title="CENDOJ Action Mock",
     version="1.3.0",
-    description="API mock para búsquedas en CENDOJ con filtros, sinónimos, relevancia y campos enriquecidos.",
+    description=(
+        "Mock de búsqueda de jurisprudencia CENDOJ con filtros habituales.\n\n"
+        "Parámetros soportados: query, organo, desde, hasta, orden, limite.\n"
+        "Orden: fecha_desc (defecto), fecha_asc, relevancia_desc, relevancia_asc.\n"
+        "Órganos: TS (Tribunal Supremo), TSJC (TS de Cataluña), AN (Audiencia Nacional), "
+        "TSJ (genérico) o cadenas tipo 'TSJ de Andalucía' (se normalizan a TSJ).\n"
+    ),
 )
 
-# CORS para que el editor del agente pueda llamar sin problemas
+# CORS amplio para facilitar llamadas desde el editor del GPT
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # si quieres, restrínge a tu dominio/origen
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# --------------------------- Modelos de respuesta -----------------------------
+
+class Resultado(BaseModel):
+    id_cendoj: Optional[str] = Field(None, description="Identificador CENDOJ si está disponible")
+    titulo: str
+    organo: str
+    sala: Optional[str] = None
+    ponente: Optional[str] = None
+    fecha: date
+    relevancia: Optional[float] = Field(
+        None, ge=0.0, le=1.0, description="Score de 0..1 (para ordenar por relevancia)"
+    )
+    url: str
+    url_detalle: Optional[str] = None
+
+class RespuestaBusqueda(BaseModel):
+    query: str
+    total: int
+    resultados: List[Resultado]
+    nota: Optional[str] = None
+
+# ------------------------------ Datos simulados -------------------------------
+
+# “Base” mínima para pruebas; puedes ampliar/ajustar libremente.
+DATASET: List[Resultado] = [
+    Resultado(
+        id_cendoj="0801932001202400077",
+        titulo="Licencia urbanística en suelo no urbanizable: criterios recientes",
+        organo="Tribunal Superior de Justicia de Cataluña (TSJC)",
+        sala="Sala de lo Contencioso-Administrativo",
+        ponente="Ponente C",
+        fecha=date.fromisoformat("2024-02-12"),
+        relevancia=0.76,
+        url="https://www.poderjudicial.es/search/indexAN.jsp",
+        url_detalle="https://www.poderjudicial.es/search/cedula.jsp?id=0801932001202400077",
+    ),
+    Resultado(
+        id_cendoj="08019320012023000123",
+        titulo="Sentencia ejemplo sobre 'volumen disconforme'",
+        organo="Tribunal Superior de Justicia de Cataluña (TSJC)",
+        sala="Sala de lo Contencioso-Administrativo",
+        ponente="Ponente A",
+        fecha=date.fromisoformat("2023-05-10"),
+        relevancia=0.53,
+        url="https://www.poderjudicial.es/search/indexAN.jsp",
+        url_detalle="https://www.poderjudicial.es/search/cedula.jsp?id=0801932001203000123",
+    ),
+    Resultado(
+        id_cendoj="28079130012022000456",
+        titulo="Sentencia ejemplo sobre 'fuera de ordenación' en suelo urbano",
+        organo="Tribunal Supremo (TS)",
+        sala="Sala Tercera (Cont.-Adm.)",
+        ponente="Ponente B",
+        fecha=date.fromisoformat("2022-11-03"),
+        relevancia=0.82,
+        url="https://www.poderjudicial.es/search/indexAN.jsp",
+        url_detalle="https://www.poderjudicial.es/search/cedula.jsp?id=28079130012022000456",
+    ),
+]
+
+# ---------------------------- Utilidades/Filtros ------------------------------
+
+# Normalización sencilla de órganos (puedes extenderla fácilmente)
+ORG_MAP = {
+    "TS": "Tribunal Supremo (TS)",
+    "TRIBUNAL SUPREMO": "Tribunal Supremo (TS)",
+    "AN": "Audiencia Nacional (AN)",
+    "AUDIENCIA NACIONAL": "Audiencia Nacional (AN)",
+    "TSJC": "Tribunal Superior de Justicia de Cataluña (TSJC)",
+    "TRIBUNAL SUPERIOR DE JUSTICIA DE CATALUÑA": "Tribunal Superior de Justicia de Cataluña (TSJC)",
+}
+# Cualquier “TSJ de …” lo normalizamos a “TSJ (varios)”
+def normaliza_organo(user_value: Optional[str]) -> Optional[str]:
+    if not user_value:
+        return None
+    v = user_value.strip().upper()
+    if v in ORG_MAP:
+        return ORG_MAP[v]
+    if v.startswith("TSJ " ) or v.startswith("TSJ DE") or v.startswith("TRIBUNAL SUPERIOR DE JUSTICIA"):
+        return "TSJ (varios)"
+    return user_value  # lo dejamos tal cual si no reconocemos, para no perder información
+
+def parse_date(s: Optional[str]) -> Optional[date]:
+    if not s:
+        return None
+    try:
+        return date.fromisoformat(s)
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"Formato de fecha inválido: {s} (usa YYYY-MM-DD)")
+
+def tokens(text: str) -> List[str]:
+    return [t for t in text.lower().replace("’", "'").replace("“","\"").replace("”","\"").split() if t]
+
+def match_approx(titulo: str, query: str) -> float:
+    """Coincidencia muy simple por tokens: proporción de tokens del query presentes en el título."""
+    q = tokens(query)
+    if not q:
+        return 1.0
+    ttl = tokens(titulo)
+    hits = sum(1 for t in q if t in ttl)
+    return hits / len(q)
+
+# ------------------------------ Endpoints -------------------------------------
 
 @app.get("/health")
 def health():
-    """Comprobación de estado."""
-    return {"status": "ok", "time": datetime.utcnow().isoformat() + "Z"}
+    return {"status": "ok"}
 
-
-@app.get("/buscar-cendoj", response_model=CendojResponse)
+@app.get(
+    "/buscar-cendoj",
+    response_model=RespuestaBusqueda,
+    summary="Buscar resoluciones (mock)",
+    description=(
+        "Devuelve resultados ficticios con estructura similar a CENDOJ.\n\n"
+        "Ejemplos:\n"
+        "• /buscar-cendoj?query=fuera%20de%20ordenaci%C3%B3n&organo=TSJC&orden=fecha_desc\n"
+        "• /buscar-cendoj?query=urbanizable&desde=2024-01-01&orden=relevancia_desc&limite=5\n"
+        "• /buscar-cendoj?query=garaje%20ilegal&orden=relevancia_desc\n"
+    ),
+)
 def buscar_cendoj(
     query: str = Query(..., min_length=2, description="Términos de búsqueda"),
-    organo: Optional[str] = Query(None, description="Órgano judicial (TS, TSJC, AN, TSJ...)"),
-    desde: Optional[str] = Query(None, description="Fecha inicial YYYY-MM-DD"),
-    hasta: Optional[str] = Query(None, description="Fecha final YYYY-MM-DD"),
-    materia: Optional[str] = Query(None, description="Materia (solo si procede)"),
-    orden: str = Query("fecha_desc", regex="^(fecha_desc|fecha_asc|relevancia_desc|relevancia_asc)$"),
-    limite: int = Query(10, ge=1, le=50, description="Límite de resultados"),
-    expandir: bool = Query(True, description="Expandir sinónimos para mejorar el recall"),
+    organo: Optional[str] = Query(None, description="Órgano (TS, TSJC, AN, TSJ de …)"),
+    desde: Optional[str] = Query(None, description="Fecha inicial (YYYY-MM-DD)"),
+    hasta: Optional[str] = Query(None, description="Fecha final (YYYY-MM-DD)"),
+    orden: Literal["fecha_desc", "fecha_asc", "relevancia_desc", "relevancia_asc"] = Query(
+        "fecha_desc", description="Criterio de ordenación"
+    ),
+    limite: int = Query(5, ge=1, le=20, description="Número máximo de resultados (1..20)"),
 ):
-    """
-    Búsqueda mock con:
-      - normalización de texto
-      - expansión de sinónimos (opcional)
-      - filtros por órgano, fechas y materia
-      - orden flexible
-      - relevancia + nota de aproximación si la coincidencia es baja
-    """
-    # Normalización y parsing de parámetros
-    org = _normaliza_organo(organo)
-    d1 = _parse_date(desde)
-    d2 = _parse_date(hasta)
-    if d1 and d2 and d2 < d1:
-        raise HTTPException(status_code=400, detail="El rango de fechas es inválido: 'hasta' < 'desde'.")
+    # Normalizar/validar filtros
+    f_desde = parse_date(desde)
+    f_hasta = parse_date(hasta)
+    if f_desde and f_hasta and f_desde > f_hasta:
+        raise HTTPException(status_code=400, detail="El rango de fechas es inválido: 'desde' > 'hasta'.")
 
-    # Construcción de términos de búsqueda
-    terms = _expand_terms(query) if expandir else _norm(query).split()
-    if not terms:
-        raise HTTPException(status_code=400, detail="La consulta no contiene términos válidos.")
+    org_norm = normaliza_organo(organo)
 
-    # Filtrado + scoring
-    candidatos: List[Tuple[dict, float]] = []
-    for item in MOCK_DATA:
-        # filtro órgano
-        if org and _norm(item["organo"]) != _norm(org):
+    # Filtrado por órgano y fechas
+    candidatos = []
+    for r in DATASET:
+        if org_norm:
+            if org_norm == "TSJ (varios)":
+                if "TSJ" not in r.organo and "Tribunal Superior de Justicia" not in r.organo:
+                    continue
+            else:
+                if r.organo != org_norm:
+                    continue
+        if f_desde and r.fecha < f_desde:
             continue
-        # filtro materia (muy básico)
-        if materia and _norm(materia) not in _norm(item.get("materia", "")):
+        if f_hasta and r.fecha > f_hasta:
             continue
-        # filtro fechas
-        f_item = datetime.strptime(item["fecha"], "%Y-%m-%d").date()
-        if d1 and f_item < d1:
-            continue
-        if d2 and f_item > d2:
-            continue
+        candidatos.append(r)
 
-        score = _result_score(item, terms)
-        # mezclamos una pizca de “relevancia” del mock si existe
-        score = (score * 0.8) + (item.get("relevancia", 0.0) * 0.2)
+    # Coincidencia por query (muy simple, suficiente para mock con 'nota')
+    nota: Optional[str] = None
+    filtrados: List[Resultado] = []
+    for r in candidatos:
+        score = match_approx(r.titulo, query)
+        # Aceptamos si hay al menos 1 token coincidente; marcamos nota si baja
         if score > 0:
-            # guardamos el score temporalmente (no sale en la respuesta)
-            cand = dict(item)
-            cand["_score"] = score
-            candidatos.append((cand, score))
+            if score < 0.51:
+                nota = "Resultados aproximados (coincidencia baja con el texto de búsqueda)."
+            filtrados.append(r)
 
-    # Orden
+    # Ordenación
     if orden == "fecha_desc":
-        candidatos.sort(key=lambda t: t[0]["fecha"], reverse=True)
+        filtrados.sort(key=lambda x: x.fecha, reverse=True)
     elif orden == "fecha_asc":
-        candidatos.sort(key=lambda t: t[0]["fecha"])
+        filtrados.sort(key=lambda x: x.fecha)
     elif orden == "relevancia_desc":
-        candidatos.sort(key=lambda t: (t[1], t[0]["fecha"]), reverse=True)
-    else:  # relevancia_asc
-        candidatos.sort(key=lambda t: (t[1], t[0]["fecha"]))
+        filtrados.sort(key=lambda x: (x.relevancia or 0.0), reverse=True)
+    elif orden == "relevancia_asc":
+        filtrados.sort(key=lambda x: (x.relevancia or 0.0))
 
-    # Nota de aproximación si las coincidencias medias son bajas
-    nota = None
-    if candidatos:
-        media = sum(s for _, s in candidatos) / len(candidatos)
-        if media < 0.35:
-            nota = "Resultados aproximados (coincidencia baja con el texto de búsqueda)."
+    # Limitar y construir respuesta (copiamos objetos para no mutar DATASET)
+    out: List[Resultado] = []
+    for r in filtrados[:limite]:
+        out.append(Resultado(**r.dict()))
 
-    # Recorte y mapeo a schema de salida
-    out: List[CendojItem] = []
-    for cand, _ in candidatos[:limite]:
-        out.append(
-            CendojItem(
-                id_cendoj=cand.get("id_cendoj"),
-                titulo=cand["titulo"],
-                organo=cand["organo"],
-                sala=cand.get("sala"),
-                ponente=cand.get("ponente"),
-                fecha=cand["fecha"],
-                relevancia=cand.get("relevancia"),
-                url=cand["url"],
-                url_detalle=cand.get("url_detalle"),
-            )
-        )
-
-    return CendojResponse(query=query, total=len(out), resultados=out, nota=nota)
-
-
-# Opcional: página raíz “amable” (no afecta al agente)
-@app.get("/")
-def root():
-    return {
-        "name": "CENDOJ Action Mock",
-        "version": "1.3.0",
-        "endpoints": {
-            "health": "/health",
-            "buscar": "/buscar-cendoj",
-            "docs": "/docs",
-            "openapi": "/openapi.json",
-        },
-    }
+    return RespuestaBusqueda(
+        query=query,
+        total=len(out),
+        resultados=out,
+        nota=nota,
+    )
