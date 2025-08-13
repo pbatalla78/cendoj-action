@@ -1,302 +1,263 @@
-from __future__ import annotations
+from fastapi import FastAPI, Query
+from typing import List, Optional, Dict, Any
+from datetime import datetime
+import uvicorn
+import re
 
-import os
-import unicodedata
-from datetime import date, datetime
-from typing import List, Optional, Tuple
+# --- (Opcional) validación de enlaces directos ---
+# Si httpx no está instalado, la validación se desactiva automáticamente.
+try:
+    import httpx  # pip install httpx
+    _HTTPX_AVAILABLE = True
+except Exception:
+    _HTTPX_AVAILABLE = False
 
-from fastapi import FastAPI, Query, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, validator
+app = FastAPI(title="CENDOJ Search API", version="1.5")
 
-# -----------------------------------------------------------------------------
-# App
-# -----------------------------------------------------------------------------
-app = FastAPI(title="CENDOJ Action Mock", version="1.4.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Render + editor del GPT
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# -----------------------------------------------------------------------------
-# Datos mock (coinciden con los usados en tus pruebas)
-# -----------------------------------------------------------------------------
-MOCK_DATA = [
+# -------------------------------------------------------------------
+# Mock de datos (sustituir por conector real a CENDOJ)
+# -------------------------------------------------------------------
+MOCK_DB: List[Dict[str, Any]] = [
     {
-        "id_cendoj": "08019320012024000077",
+        "id_cendoj": "0801932001202400077",
+        "roj": "STS 1234/2024",
+        "ecli": "ECLI:ES:TS:2024:1234",
         "titulo": "Licencia urbanística en suelo no urbanizable: criterios recientes",
         "organo": "Tribunal Superior de Justicia de Cataluña (TSJC)",
         "sala": "Sala de lo Contencioso-Administrativo",
         "ponente": "Ponente C",
         "fecha": "2024-02-12",
-        "relevancia": 0.76,
-        "url": "https://www.poderjudicial.es/search/indexAN.jsp",
-        "url_detalle": "https://www.poderjudicial.es/search/cedula.jsp?id=08019320012024000077",
-    },
-    {
-        "id_cendoj": "08019320012023000123",
-        "titulo": "Sentencia ejemplo sobre 'volumen disconforme'",
-        "organo": "Tribunal Superior de Justicia de Cataluña (TSJC)",
-        "sala": "Sala de lo Contencioso-Administrativo",
-        "ponente": "Ponente A",
-        "fecha": "2023-05-10",
-        "relevancia": 0.18,
-        "url": "https://www.poderjudicial.es/search/indexAN.jsp",
-        "url_detalle": "https://www.poderjudicial.es/search/cedula.jsp?id=08019320012023000123",
+        "resumen": "Criterios sobre licencias en suelos no urbanizables (TSJC).",
+        "relevancia": 0.76
     },
     {
         "id_cendoj": "28079130012022000456",
+        "roj": "STS 456/2022",
+        "ecli": "ECLI:ES:TS:2022:456",
         "titulo": "Sentencia ejemplo sobre 'fuera de ordenación' en suelo urbano",
         "organo": "Tribunal Supremo (TS)",
         "sala": "Sala Tercera (Cont.-Adm.)",
         "ponente": "Ponente B",
         "fecha": "2022-11-03",
-        "relevancia": 0.82,
-        "url": "https://www.poderjudicial.es/search/indexAN.jsp",
-        "url_detalle": "https://www.poderjudicial.es/search/cedula.jsp?id=28079130012022000456",
+        "resumen": "Criterios sobre situación de fuera de ordenación en suelo urbano (TS).",
+        "relevancia": 0.82
     },
+    {
+        "id_cendoj": "08019320012023000123",
+        "roj": "STS 789/2023",
+        "ecli": "ECLI:ES:TS:2023:789",
+        "titulo": "Sentencia ejemplo sobre volumen disconforme",
+        "organo": "Tribunal Superior de Justicia de Cataluña (TSJC)",
+        "sala": "Sala de lo Contencioso-Administrativo",
+        "ponente": "Ponente A",
+        "fecha": "2023-05-10",
+        "resumen": "Caso sobre edificación/volumen disconforme con el planeamiento (TSJC).",
+        "relevancia": 0.18
+    }
 ]
 
-# -----------------------------------------------------------------------------
-# Utilidades de normalización / scoring
-# -----------------------------------------------------------------------------
-def _strip_accents(s: str) -> str:
-    return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
-
-
-def _norm(s: str) -> str:
-    return _strip_accents(s or "").lower().strip()
-
-
-def _tokenize(s: str) -> List[str]:
-    s = _norm(s)
-    # separadores simples
-    for ch in [",", ";", ":", ".", "(", ")", "[", "]", "{", "}", "’", "'", "“", "”", '"', "/"]:
-        s = s.replace(ch, " ")
-    return [t for t in s.split() if t]
-
-
-# Mapa de sinónimos básicos de nuestras pruebas
-SYNONYMS = {
-    "volumen disconforme": ["edificacion disconforme", "alteracion de volumen", "aumento de edificabilidad", "disconformidad con planeamiento"],
-    "fuera de ordenacion": ["situacion de fuera de ordenacion", "edificacion disconforme", "ordenacion urbanistica"],
-    "suelo no urbanizable": ["suelo rustico", "suelos protegidos"],
-    "garaje ilegal": ["construccion ilegal", "obra sin licencia"],
+# -------------------------------------------------------------------
+# Sinónimos + normalización
+# -------------------------------------------------------------------
+SYNONYMS: Dict[str, List[str]] = {
+    "suelo no urbanizable": ["suelo rústico", "suelos protegidos", "suelo rustico"],
+    "fuera de ordenación": ["fuera ordenación", "situación de fuera de ordenación", "edificación disconforme"],
+    "volumen disconforme": ["alteración de volumen", "aumento de edificabilidad", "edificación disconforme"],
 }
 
-# Órganos soportados (formas normalizadas para filtrar)
-ORGANO_MAP = {
-    "ts": "tribunal supremo (ts)",
-    "tribunal supremo": "tribunal supremo (ts)",
-    "tsjc": "tribunal superior de justicia de cataluna (tsjc)",
-    "tribunal superior de justicia de cataluña": "tribunal superior de justicia de cataluna (tsjc)",
-    "tribunal superior de justicia de cataluna": "tribunal superior de justicia de cataluna (tsjc)",
-    "audiencia nacional": "audiencia nacional",
-    "an": "audiencia nacional",
-}
+def normalize_text(s: str) -> str:
+    s = s.lower().strip()
+    s = re.sub(r"[“”\"'´`]", "", s)
+    s = re.sub(r"\s+", " ", s)
+    return s
 
-
-def _expand_with_synonyms(query: str) -> Tuple[str, bool]:
-    """
-    Si la query contiene una clave con sinónimos, añadimos los sinónimos para ampliar coincidencia.
-    Devuelve (query_expandida, se_uso_sinonimo)
-    """
-    qn = _norm(query)
-    used = False
+def expand_query(q: str) -> List[str]:
+    qn = normalize_text(q)
+    expanded = {qn}
     for key, syns in SYNONYMS.items():
         if key in qn:
-            # añadimos términos sinónimos para mejorar recall
-            query = f"{query} " + " ".join(syns)
-            used = True
-    return query, used
+            expanded.update([normalize_text(s) for s in syns])
+    return list(expanded)
 
+# -------------------------------------------------------------------
+# Ranking híbrido (relevancia + match textual)
+# -------------------------------------------------------------------
+def hybrid_rank(results: List[Dict[str, Any]], terms: List[str]) -> List[Dict[str, Any]]:
+    for r in results:
+        title_norm = normalize_text(r.get("titulo", ""))
+        match_score = sum(1 for t in terms if t in title_norm)
+        base_rel = float(r.get("relevancia", 0.0))
+        # 70% relevancia declarada + 30% coincidencia textual (normalizada)
+        r["_score"] = (base_rel * 0.70) + (min(match_score, 3) / 3.0) * 0.30
+    return sorted(results, key=lambda x: x["_score"], reverse=True)
 
-def _score_match(query_tokens: List[str], text: str) -> float:
-    """
-    Score muy sencillo por solapamiento de tokens en título y metadatos.
-    """
-    if not query_tokens:
-        return 0.0
-    text_tokens = set(_tokenize(text))
-    if not text_tokens:
-        return 0.0
-    hits = sum(1 for t in query_tokens if t in text_tokens)
-    return hits / max(len(query_tokens), 1)
+# -------------------------------------------------------------------
+# Filtros temporales explícitos
+# -------------------------------------------------------------------
+def apply_date_filter(results: List[Dict[str, Any]], desde: Optional[str], hasta: Optional[str]) -> List[Dict[str, Any]]:
+    if not desde and not hasta:
+        return results
 
+    def parse_date(d: str) -> datetime:
+        return datetime.strptime(d, "%Y-%m-%d")
 
-def _parse_date(s: Optional[str]) -> Optional[date]:
-    if not s:
+    out = []
+    for r in results:
+        try:
+            f = parse_date(r["fecha"])
+        except Exception:
+            # si el dato está malformado, lo excluimos del filtro (o lo incluimos por defecto)
+            continue
+        if desde and f < parse_date(desde):
+            continue
+        if hasta and f > parse_date(hasta):
+            continue
+        out.append(r)
+    return out
+
+# -------------------------------------------------------------------
+# Estrategia de enlaces (híbrida)
+# - url_directo: cedula.jsp?id=...
+# - url_estable: búsqueda por ECLI (o por Id CENDOJ si no hay ECLI)
+# Validación opcional: HEAD al url_directo para marcar si está caído (404, etc.)
+# -------------------------------------------------------------------
+def build_links(r: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    base_direct = f"https://www.poderjudicial.es/search/cedula.jsp?id={r['id_cendoj']}"
+    ecli = r.get("ecli")
+    if ecli:
+        stable = f"https://www.google.com/search?q=site%3Apoderjudicial.es+%22{ecli}%22"
+    else:
+        # fallback: búsqueda por id_cendoj si no hay ECLI
+        stable = f"https://www.google.com/search?q=site%3Apoderjudicial.es+%22{r['id_cendoj']}%22"
+    return {"url_directo": base_direct, "url_estable": stable}
+
+def check_direct_link(url: str, timeout_s: float = 2.5) -> Optional[int]:
+    if not _HTTPX_AVAILABLE:
         return None
     try:
-        return datetime.strptime(s, "%Y-%m-%d").date()
+        # HEAD suele ser suficiente y rápido; si el servidor no lo soporta, httpx hará GET (follow redirects False)
+        with httpx.Client(timeout=timeout_s, follow_redirects=False) as client:
+            resp = client.head(url)
+            return resp.status_code
     except Exception:
-        return None
+        return 0  # error de red u otros
 
-
-def _validate_and_fix_range(desde: Optional[str], hasta: Optional[str]) -> Tuple[Optional[date], Optional[date], Optional[str]]:
-    d1 = _parse_date(desde)
-    d2 = _parse_date(hasta)
-    if d1 and d2 and d1 > d2:
-        # Corrige rango invertido (mejora 4)
-        return d2, d1, "Se corrigió el rango de fechas (invertido)."
-    return d1, d2, None
-
-
-def _normalize_organo(organo: Optional[str]) -> Optional[str]:
-    if not organo:
-        return None
-    o = _norm(organo)
-    return ORGANO_MAP.get(o, o)
-
-
-# -----------------------------------------------------------------------------
-# Schemas de respuesta
-# -----------------------------------------------------------------------------
-class Resultado(BaseModel):
-    id_cendoj: Optional[str] = None
-    titulo: str
-    organo: str
-    sala: Optional[str] = None
-    ponente: Optional[str] = None
-    fecha: str
-    relevancia: Optional[float] = Field(None, description="0..1")
-    url: str
-    url_detalle: Optional[str] = None
-
-
-class BuscarResponse(BaseModel):
-    query: str
-    total: int
-    resultados: List[Resultado]
-    nota: Optional[str] = None
-
-
-# -----------------------------------------------------------------------------
-# Endpoints
-# -----------------------------------------------------------------------------
-@app.get("/health")
-def health():
-    return {"status": "ok", "service": "cendoj-action-mock", "time": datetime.utcnow().isoformat()}
-
-
-@app.get("/buscar-cendoj", response_model=BuscarResponse)
+# -------------------------------------------------------------------
+# Endpoint principal
+# -------------------------------------------------------------------
+@app.get("/buscar-cendoj")
 def buscar_cendoj(
-    query: str = Query(..., min_length=2, description="Términos de búsqueda"),
-    organo: Optional[str] = Query(None, description="Órgano: TS, TSJC, Audiencia Nacional…"),
+    query: str = Query(..., description="Texto a buscar"),
     desde: Optional[str] = Query(None, description="Fecha inicial (YYYY-MM-DD)"),
     hasta: Optional[str] = Query(None, description="Fecha final (YYYY-MM-DD)"),
-    orden: Optional[str] = Query("fecha_desc", regex="^(fecha_desc|fecha_asc|relevancia_desc|relevancia_asc)$",
-                                 description="Criterio de ordenación"),
-    limite: Optional[int] = Query(5, ge=1, le=50, description="Nº máximo de resultados"),
+    orden: Optional[str] = Query("relevancia_desc", description="Orden: relevancia_desc | fecha_desc | fecha_asc"),
+    limite: Optional[int] = Query(10, ge=1, le=50, description="Número máximo de resultados"),
+    validar_enlaces: Optional[bool] = Query(False, description="Si True, verifica si el enlace directo responde (HEAD)")
 ):
-    """
-    Buscador mock con:
-    - Normalización (acentos, mayúsculas)
-    - Sinónimos (amplía coincidencia)
-    - Scoring por tokens (relevancia)
-    - Filtros por órgano y fechas
-    - Notas explicativas cuando:
-        * se usan sinónimos,
-        * rango invertido fue corregido,
-        * coincidencia baja (aproximados),
-        * no hay resultados.
-    """
-    notes: List[str] = []
+    notas: List[str] = []
+    terms = expand_query(query)
+    # Si se expandieron sinónimos, avisamos (sin ruido si es el mismo término)
+    if len(terms) > 1:
+        notas.append("Se usaron sinónimos comunes para ampliar la coincidencia.")
 
-    # 1) Normalización y sinónimos
-    expanded_query, used_syns = _expand_with_synonyms(query)
-    if used_syns:
-        notes.append("Se usaron sinónimos comunes para ampliar la coincidencia.")
-    q_tokens = _tokenize(expanded_query)
+    # Corrección de rango de fechas invertido
+    if desde and hasta:
+        try:
+            if datetime.strptime(desde, "%Y-%m-%d") > datetime.strptime(hasta, "%Y-%m-%d"):
+                desde, hasta = hasta, desde
+                notas.append("Se corrigió el rango de fechas (invertido).")
+        except Exception:
+            pass  # si no son fechas válidas, ya fallará el filtro de manera inocua
 
-    # 2) Fechas
-    d1, d2, fixed = _validate_and_fix_range(desde, hasta)
-    if fixed:
-        notes.append(fixed)
+    # Matching muy simple sobre el mock (en producción reemplazar por consulta real)
+    results = []
+    for r in MOCK_DB:
+        title_norm = normalize_text(r.get("titulo", ""))
+        if any(t in title_norm for t in terms):
+            results.append(r.copy())
 
-    # 3) Órgano normalizado
-    organo_norm = _normalize_organo(organo)
+    # Filtros temporales
+    results = apply_date_filter(results, desde, hasta)
 
-    # 4) Filtrado + scoring
-    results: List[dict] = []
-    for r in MOCK_DATA:
-        # filtro órgano (si se indica)
-        if organo_norm:
-            if _norm(r["organo"]) != organo_norm:
-                continue
-
-        # filtro fechas
-        rdate = _parse_date(r["fecha"])
-        if d1 and rdate and rdate < d1:
-            continue
-        if d2 and rdate and rdate > d2:
-            continue
-
-        # scoring simple sobre título + metadatos clave
-        text = f"{r['titulo']} {r['organo']} {r.get('sala') or ''} {r.get('ponente') or ''}"
-        score = _score_match(q_tokens, text)
-
-        # guardamos una 'relevancia_calc' para ordenar si procede
-        r_copy = dict(r)
-        r_copy["_relevancia_calc"] = score
-        results.append(r_copy)
-
-    # 5) Aproximación: si hay resultados pero el score medio es bajo
-    approx = False
-    if results:
-        avg = sum(x["_relevancia_calc"] for x in results) / max(len(results), 1)
-        if avg < 0.25:
-            approx = True
-            notes.append("Resultados aproximados (coincidencia baja con el texto de búsqueda).")
-
-    # 6) Ordenación
+    # Ranking híbrido + orden
+    results = hybrid_rank(results, terms)
     if orden == "fecha_desc":
-        results.sort(key=lambda x: x["fecha"], reverse=True)
+        results.sort(key=lambda x: x.get("fecha", ""), reverse=True)
     elif orden == "fecha_asc":
-        results.sort(key=lambda x: x["fecha"])
-    elif orden == "relevancia_desc":
-        # prioriza relevancia calculada y, como desempate, relevancia mock y fecha
-        results.sort(key=lambda x: (x["_relevancia_calc"], x.get("relevancia", 0.0), x["fecha"]), reverse=True)
-    elif orden == "relevancia_asc":
-        results.sort(key=lambda x: (x["_relevancia_calc"], x.get("relevancia", 0.0), x["fecha"]))
-    else:
-        # fallback seguro
-        results.sort(key=lambda x: x["fecha"], reverse=True)
+        results.sort(key=lambda x: x.get("fecha", ""))
+    # por defecto: relevancia_desc ya lo aplica hybrid_rank
 
-    # 7) Límite
-    results = results[:limite or 5]
+    if not results:
+        return {
+            "query": query,
+            "total": 0,
+            "resultados": [],
+            "nota": " ".join(notas) if notas else "No se han encontrado resultados exactos. Prueba con sinónimos o ajusta el rango de fechas."
+        }
 
-    # 8) Construcción de respuesta
-    payload = [
-        Resultado(
-            id_cendoj=r.get("id_cendoj"),
-            titulo=r["titulo"],
-            organo=r["organo"],
-            sala=r.get("sala"),
-            ponente=r.get("ponente"),
-            fecha=r["fecha"],
-            relevancia=r.get("relevancia"),
-            url=r["url"],
-            url_detalle=r.get("url_detalle"),
-        ).dict()
-        for r in results
-    ]
+    formatted: List[Dict[str, Any]] = []
+    broken_count = 0
 
-    # 9) Nota final
-    note_text = None
-    if notes:
-        # unimos notas de manera compacta
-        note_text = " ".join(sorted(set(notes)))
-    elif not results:
-        note_text = None  # respuesta vacía pero sin incidencias
+    for r in results[:limite]:
+        # Resúmenes consistentes (si faltara en la fuente)
+        resumen = r.get("resumen") or "Resumen no disponible con precisión."
 
-    return BuscarResponse(
-        query=query,
-        total=len(payload),
-        resultados=payload,
-        nota=note_text,
-    )
+        links = build_links(r)
+        enlace_valido: Optional[bool] = None
+        estrategia = "directo"
+
+        if validar_enlaces:
+            status = check_direct_link(links["url_directo"])
+            # status None => no se pudo validar (httpx no disponible). 0/error o >=400 => roto.
+            if status is None:
+                enlace_valido = None
+            elif status == 0 or (status is not None and status >= 400):
+                enlace_valido = False
+                estrategia = "estable"
+                broken_count += 1
+            else:
+                enlace_valido = True
+
+        resultado = {
+            "titulo": r.get("titulo"),
+            "organo": r.get("organo"),
+            "sala": r.get("sala") or "",
+            "ponente": r.get("ponente") or "",
+            "fecha": r.get("fecha"),
+            "relevancia": round(float(r.get("relevancia", 0.0)) * 100),  # en %
+            "resumen": resumen,
+            "id_cendoj": r.get("id_cendoj"),
+            "roj": r.get("roj"),
+            "ecli": r.get("ecli"),
+            # Estrategia híbrida de enlaces
+            "url_directo": links["url_directo"],
+            "url_estable": links["url_estable"],
+            "enlace_preferido": links["url_directo"] if estrategia == "directo" else links["url_estable"],
+            "estrategia_enlace": estrategia,
+        }
+        if validar_enlaces:
+            resultado["enlace_directo_ok"] = enlace_valido
+
+        formatted.append(resultado)
+
+    if validar_enlaces:
+        if broken_count > 0:
+            notas.append(f"{broken_count} enlace(s) directo(s) devolvieron error; se sugiere usar el enlace estable.")
+
+    return {
+        "query": query,
+        "total": len(results),
+        "resultados": formatted,
+        "nota": " ".join(notas) if notas else None
+    }
+
+# -------------------------------------------------------------------
+# Salud
+# -------------------------------------------------------------------
+@app.get("/health")
+def health():
+    return {"status": "ok", "version": app.version, "httpx": _HTTPX_AVAILABLE}
+
+# -------------------------------------------------------------------
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
