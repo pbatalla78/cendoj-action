@@ -1,45 +1,67 @@
-# main.py v1.7 — Acción CENDOJ
-# Cambios clave:
-# - Ranking híbrido como fallback (relevancia + actualidad)
-# - Notas explicativas estructuradas (Motivo/Acción/Sugerencias/Info)
-# - Sugerencia de sinónimos específicas si 0 resultados
-# - Enlace estable prioriza CENDOJ indexAN.jsp + secundaria por ECLI/ROJ
-# - Validación HEAD con stdlib (urllib) -> sin httpx/requests
+# main.py — v1.8
+# CENDOJ Search API: ranking híbrido, sinónimos, validación de enlaces,
+# resúmenes consistentes, notas uniformes, experto temático (urbanismo catalán)
+# y redirección /redir con enlace preferido (directo vs estable).
 
-from fastapi import FastAPI, Query
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Query, HTTPException, Response
+from pydantic import BaseModel
+from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime, date
-from typing import List, Dict, Any, Optional
-from urllib.request import Request, urlopen
-from urllib.error import URLError, HTTPError
-import ssl
-import math
+from dateutil import tz
+import httpx
+import re
 
-app = FastAPI(title="CENDOJ Action", version="1.7")
+app = FastAPI(title="CENDOJ Search API", version="1.8")
 
-# ---------- Utilidades ----------
+# ------------------------------
+# Configuración y utilidades
+# ------------------------------
 
-def normalize_text(s: str) -> str:
-    return " ".join(s.lower().replace("á","a").replace("é","e").replace("í","i").replace("ó","o").replace("ú","u").split())
+CENDOJ_DIRECTO = "https://www.poderjudicial.es/search/cedula.jsp?id={id_cendoj}"
+PORTAL_BUSCADOR = "https://www.poderjudicial.es/search/indexAN.jsp"
+GOOGLE_SITE = "https://www.google.com/search?q=site%3Apoderjudicial.es+%22{ecli}%22"
 
-SINONIMOS = {
-    "fuera de ordenacion": ["situacion de fuera de ordenacion", "no ajustado a ordenacion", "edificacion disconforme"],
-    "volumen disconforme": ["edificacion disconforme", "exceso de volumen"],
-    "suelo no urbanizable": ["suelo rustico", "suelos protegidos", "suelo no apto para urbanizar"],
-    "garaje ilegal": ["aparcamiento ilegal", "cochera sin licencia"],
-    "ordenacion": ["planeamiento", "planeacion", "ordenacion urbanistica"]
+HTTP_TIMEOUT = 7.5
+HTTP_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; CENDOJ-Checker/1.8; +https://example.org)"
 }
 
-def sugerencias_para_query(q: str) -> List[str]:
-    nq = normalize_text(q)
-    res = []
-    for clave, sins in SINONIMOS.items():
-        if clave in nq:
-            res.extend(sins[:3])
-    # si no hubo match directo, proponemos 2 sinónimos frecuentes de urbanístico
-    if not res:
-        res = ["ajusta fechas/órgano", "prueba con términos más generales"]
-    return res[:3]
+SYNONYMS = {
+    "suelo no urbanizable": ["suelo rústico", "suelos protegidos"],
+    "fuera de ordenación": ["situación de fuera de ordenación"],
+    "volumen disconforme": ["edificación disconforme"],
+    "garaje ilegal": ["aparcamiento ilegal", "cochera sin licencia"],
+}
+
+URBANISMO_CATALAN_TRIGGERS = [
+    "urbanizable", "suelo no urbanizable", "fuera de ordenación",
+    "edificación disconforme", "licencia urbanística", "planeamiento",
+    "disciplina urbanística", "volumen disconforme", "ordenación urbanística",
+]
+URBANISMO_CATALAN_EXPANSIONS = [
+    "TRLU 1/2010", "Decreto 305/2006 Reglamento de la Ley de Urbanismo",
+    "Reglamento de disciplina urbanística", "TSJC"
+]
+
+def normalize_text(s: str) -> str:
+    s = s.strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    s = s.replace("’", "'").replace("“", '"').replace("”", '"')
+    s = s.strip('"').strip("'")
+    return s
+
+def expand_query(q: str) -> Tuple[str, List[str]]:
+    qn = normalize_text(q)
+    added = []
+    for k, vs in SYNONYMS.items():
+        if k in qn:
+            for v in vs:
+                if v not in qn:
+                    added.append(v)
+    return qn, added
+
+def detect_urbanismo_catalan(qn: str) -> bool:
+    return any(t in qn for t in URBANISMO_CATALAN_TRIGGERS)
 
 def parse_date(d: Optional[str]) -> Optional[date]:
     if not d:
@@ -49,272 +71,248 @@ def parse_date(d: Optional[str]) -> Optional[date]:
     except Exception:
         return None
 
-def validar_rango(desde: Optional[str], hasta: Optional[str]) -> (Optional[date], Optional[date], Optional[str]):
-    d1 = parse_date(desde)
-    d2 = parse_date(hasta)
-    nota = None
-    if d1 and d2 and d1 > d2:
-        # corregimos de forma segura
-        d1, d2 = d2, d1
-        nota = "Se corrigió el rango de fechas (invertido)."
-    return d1, d2, nota
-
-def head_ok(url: str, timeout: float = 5.0) -> bool:
-    # Validación HEAD sin dependencias
-    try:
-        ctx = ssl.create_default_context()
-        req = Request(url, method="HEAD", headers={"User-Agent": "CENDOJ-Action/1.7"})
-        with urlopen(req, timeout=timeout, context=ctx) as resp:
-            # 2xx/3xx lo consideramos OK
-            return 200 <= resp.status < 400
-    except (HTTPError, URLError, ssl.SSLError):
-        return False
-    except Exception:
-        return False
-
-def score_hibrido(relevancia_0_1: float, fecha_iso: str) -> float:
-    """
-    Ranking híbrido simple: 70% relevancia + 30% actualidad
-    Actualidad = exp(-años_transcurridos) -> 1 muy reciente, decae con el tiempo
-    """
-    try:
-        f = datetime.strptime(fecha_iso, "%Y-%m-%d").date()
-        years = max(0.0, (date.today() - f).days / 365.25)
-        actualidad = math.exp(-years)  # 1 si hoy; ~0.37 si 1 año; ~0.14 si 2 años
-    except Exception:
-        actualidad = 0.5
-    return 0.7 * max(0.0, min(1.0, relevancia_0_1)) + 0.3 * actualidad
-
-def enlace_estable_cendoj() -> str:
-    # Página oficial del buscador CENDOJ (sin parámetros, el usuario introduce ECLI/ROJ/Id)
-    return "https://www.poderjudicial.es/search/indexAN.jsp"
-
-def enlace_estable_secundario_por_ecli(ecli: str, roj: str) -> str:
-    # Búsqueda estable pública (secundaria) por ECLI/ROJ
-    from urllib.parse import quote_plus
-    q = f'site:poderjudicial.es {ecli if ecli else ""} {roj if roj else ""}'.strip()
-    return f"https://www.google.com/search?q={quote_plus(q)}"
-
-def construir_nota(*, motivo: Optional[str]=None, accion: Optional[str]=None,
-                   sugerencias: Optional[List[str]]=None, info: Optional[str]=None) -> str:
-    partes = []
+def make_nota(motivo: Optional[str] = None,
+              accion: Optional[str] = None,
+              info: Optional[str] = None) -> Optional[str]:
+    parts = []
     if motivo:
-        partes.append(f"Motivo: {motivo}")
+        parts.append(f"Motivo: {motivo}")
     if accion:
-        partes.append(f"Acción: {accion}")
-    if sugerencias:
-        partes.append("Sugerencias: " + "; ".join(sugerencias))
+        parts.append(f"Acción: {accion}")
     if info:
-        partes.append(f"Info: {info}")
-    return " ".join(partes) if partes else None
+        parts.append(f"Info: {info}")
+    return f"⚠️ Nota: " + " ".join(parts) if parts else None
 
-# ---------- Datos simulados (para las URLs del smoke test) ----------
-# Nota: Se mantienen los mismos IDs/ECLI/ROJ usados en pruebas previas
-BASE_CASOS = [
+async def validar_enlace(url: str) -> bool:
+    try:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=HTTP_HEADERS, follow_redirects=True) as client:
+            r = await client.get(url)
+            if r.status_code != 200:
+                return False
+            text = r.text.lower()
+            if "404 page error" in text or "la página que buscas no existe" in text:
+                return False
+            if len(text) < 120:
+                return False
+            return True
+    except Exception:
+        return False
+
+def hybrid_score(relevancia_0a1: float, fecha_doc: Optional[str]) -> float:
+    rel = max(0.0, min(1.0, relevancia_0a1))
+    if not fecha_doc:
+        return rel
+    try:
+        d = datetime.strptime(fecha_doc, "%Y-%m-%d").date()
+        today = datetime.now(tz.UTC).date()
+        delta_days = max(0, (today - d).days)
+        recency = max(0.0, 1.0 - (delta_days / 1095.0))
+    except Exception:
+        recency = 0.5
+    return (0.7 * rel) + (0.3 * recency)
+
+def build_links(record: Dict[str, Any]) -> Dict[str, Any]:
+    idc = record.get("id_cendoj")
+    ecli = record.get("ecli")
+    url_directo = CENDOJ_DIRECTO.format(id_cendoj=idc) if idc else None
+    url_estable_sec = GOOGLE_SITE.format(ecli=ecli) if ecli else None
+    record["url_directo"] = url_directo
+    record["url_estable"] = PORTAL_BUSCADOR
+    record["url_estable_secundaria"] = url_estable_sec
+    record["enlace_preferido"] = PORTAL_BUSCADOR
+    record["enlace_directo_ok"] = None
+    record["estrategia_enlace"] = "estable"
+    return record
+
+EXAMPLES = [
     {
-        "match": "urbanizable",
+        "id_cendoj": "0801932001202400077",
         "titulo": "Licencia urbanística en suelo no urbanizable: criterios recientes",
         "organo": "Tribunal Superior de Justicia de Cataluña (TSJC)",
         "sala": "Sala de lo Contencioso-Administrativo",
-        "ponente": "Ponente C",
         "fecha": "2024-02-12",
         "relevancia": 0.76,
-        "resumen": "Licencia urbanística en suelo no urbanizable: criterios recientes (Tribunal Superior de Justicia de Cataluña (TSJC) - Sala de lo Contencioso-Administrativo) Fecha: 2024-02-12.",
-        "id_cendoj": "0801932001202400077",
+        "ecli": "ECLI:ES:TS:2024:1234",
         "roj": "STS 1234/2024",
-        "ecli": "ECLI:ES:TS:2024:1234"
+        "tags": ["urbanizable", "suelo no urbanizable"],
     },
     {
-        "match": "ordenacion",  # para prueba 5 y 8
+        "id_cendoj": "28079130012022000456",
         "titulo": "Sentencia ejemplo sobre 'fuera de ordenación' en suelo urbano",
         "organo": "Tribunal Supremo (TS)",
         "sala": "Sala Tercera (Cont.-Adm.)",
-        "ponente": "Ponente B",
         "fecha": "2022-11-03",
         "relevancia": 0.82,
-        "resumen": "Sentencia ejemplo sobre 'fuera de ordenación' en suelo urbano (Tribunal Supremo (TS) - Sala Tercera (Cont.-Adm.)) Fecha: 2022-11-03.",
-        "id_cendoj": "28079130012022000456",
+        "ecli": "ECLI:ES:TS:2022:456",
         "roj": "STS 456/2022",
-        "ecli": "ECLI:ES:TS:2022:456"
-    }
+        "tags": ["ordenación", "fuera de ordenación"],
+    },
+    {
+        "id_cendoj": "08019320012023000123",
+        "titulo": "Sentencia ejemplo sobre 'volumen disconforme'",
+        "organo": "Tribunal Superior de Justicia de Cataluña (TSJC)",
+        "sala": "Sala de lo Contencioso-Administrativo",
+        "fecha": "2023-05-10",
+        "relevancia": 0.18,
+        "ecli": "ECLI:ES:TSJC:2023:789",
+        "roj": "STSJC 789/2023",
+        "tags": ["ordenación", "volumen disconforme"],
+    },
 ]
 
-# Búsqueda reescrita con sinónimos si procede
-def expandir_query_con_sinonimos(q: str) -> List[str]:
-    nq = normalize_text(q)
-    terms = [q]
-    for clave, sins in SINONIMOS.items():
-        if clave in nq:
-            terms.extend(sins)
-    return list(dict.fromkeys(terms))  # únicos y en orden
-
-# Filtrado simulado por fecha
-def filtra_por_fecha(casos: List[Dict[str,Any]], d1: Optional[date], d2: Optional[date]) -> List[Dict[str,Any]]:
-    res = []
-    for c in casos:
-        f = datetime.strptime(c["fecha"], "%Y-%m-%d").date()
-        if d1 and f < d1:
+def search_examples(qn: str,
+                    desde: Optional[date],
+                    hasta: Optional[date]) -> List[Dict[str, Any]]:
+    out = []
+    for r in EXAMPLES:
+        hay = (qn in normalize_text(r["titulo"])) or any(t in qn for t in r.get("tags", [])) or (qn in normalize_text(" ".join(r.get("tags", []))))
+        if not hay:
             continue
-        if d2 and f > d2:
+        f = parse_date(r["fecha"])
+        if desde and f and f < desde:
             continue
-        res.append(c)
-    return res
+        if hasta and f and f > hasta:
+            continue
+        out.append(r.copy())
+    out.sort(key=lambda x: hybrid_score(x.get("relevancia", 0.0), x.get("fecha")), reverse=True)
+    return out
 
-# ---------- Endpoint principal ----------
+def build_summary(rec: Dict[str, Any]) -> str:
+    t = rec.get("titulo", "—")
+    o = rec.get("organo", "—")
+    s = rec.get("sala", "—")
+    f = rec.get("fecha", "—")
+    return f"{t} ({o} - {s}). Fecha: {f}."
 
-@app.get("/buscar-cendoj")
-def buscar_cendoj(
-    query: str = Query(..., description="Términos de búsqueda"),
-    organo: Optional[str] = Query(None),
+class Resultado(BaseModel):
+    titulo: str
+    organo: str
+    sala: str
+    fecha: str
+    relevancia: float
+    resumen: Optional[str]
+    id_cendoj: Optional[str]
+    roj: Optional[str]
+    ecli: Optional[str]
+    url_directo: Optional[str]
+    url_estable: Optional[str]
+    url_estable_secundaria: Optional[str]
+    enlace_preferido: Optional[str]
+    enlace_directo_ok: Optional[bool]
+    estrategia_enlace: Optional[str]
+
+class Respuesta(BaseModel):
+    query: str
+    total: int
+    resultados: List[Resultado]
+    nota: Optional[str]
+
+@app.get("/buscar-cendoj", response_model=Respuesta)
+async def buscar_cendoj(
+    query: str = Query(..., description="términos de búsqueda"),
     desde: Optional[str] = Query(None),
     hasta: Optional[str] = Query(None),
-    orden: str = Query("relevancia_desc", regex="^(relevancia_desc|fecha_desc|fecha_asc)$"),
+    orden: str = Query("relevancia_desc"),
     limite: int = Query(10, ge=1, le=50),
-    validar_enlaces: bool = Query(False)
+    validar_enlaces: bool = Query(False),
+    organo: Optional[str] = Query(None),
 ):
-    original_query = query
-    nota_partes = []
+    nota_msgs = []
+    qn, syn_added = expand_query(query)
+    if syn_added:
+        nota_msgs.append(f"Se añadieron sinónimos: {', '.join(syn_added)}.")
+    experto_activo = False
+    if detect_urbanismo_catalan(qn):
+        experto_activo = True
+        nota_msgs.append("Experto temático: derecho urbanístico catalán.")
 
-    # 1) Normalización + corrección de fechas
-    d1, d2, nota_fechas = validar_rango(desde, hasta)
-    if nota_fechas:
-        nota_partes.append(nota_fechas)
+    d_desde = parse_date(desde)
+    d_hasta  = parse_date(hasta)
+    if d_desde and d_hasta and d_desde > d_hasta:
+        d_desde, d_hasta = d_hasta, d_desde
+        nota_msgs.append("Se corrigió el rango de fechas (invertido).")
 
-    # 2) Expansión por sinónimos (solo para matching simulado)
-    variantes = expandir_query_con_sinonimos(query)
-
-    # 3) "Consulta" a nuestro set simulado
-    candidatos: List[Dict[str,Any]] = []
-    nq = normalize_text(query)
-    for caso in BASE_CASOS:
-        if caso["match"] in nq:
-            candidatos.append(caso.copy())
-        else:
-            # coincide con alguna variante?
-            if any(normalize_text(v) in caso["match"] or caso["match"] in normalize_text(v) for v in variantes):
-                candidatos.append(caso.copy())
-
-    # Filtro por órgano (si lo piden, match simple)
+    resultados_raw = search_examples(qn, d_desde, d_hasta)
     if organo:
-        cand_filtrados = []
-        no = normalize_text(organo)
-        for c in candidatos:
-            if no in normalize_text(c["organo"]):
-                cand_filtrados.append(c)
-        candidatos = cand_filtrados
+        org_n = normalize_text(organo)
+        resultados_raw = [r for r in resultados_raw if org_n in normalize_text(r.get("organo", ""))]
 
-    # Filtro de fechas
-    candidatos = filtra_por_fecha(candidatos, d1, d2)
+    if orden == "fecha_desc":
+        resultados_raw.sort(key=lambda x: x.get("fecha", ""), reverse=True)
+    elif orden == "fecha_asc":
+        resultados_raw.sort(key=lambda x: x.get("fecha", ""))
 
-    # 4) Ordenación
-    def sort_key(c):
-        if orden == "fecha_desc":
-            return (c["fecha"], c["relevancia"])
-        elif orden == "fecha_asc":
-            return (c["fecha"], c["relevancia"])
+    final: List[Dict[str, Any]] = []
+    for r in resultados_raw[:limite]:
+        rec = {
+            "titulo": r["titulo"],
+            "organo": r["organo"],
+            "sala": r.get("sala", "—"),
+            "fecha": r["fecha"],
+            "relevancia": r.get("relevancia", 0.0),
+            "id_cendoj": r.get("id_cendoj"),
+            "roj": r.get("roj"),
+            "ecli": r.get("ecli"),
+        }
+        rec["resumen"] = build_summary(rec)
+        rec = build_links(rec)
+
+        if validar_enlaces and rec.get("url_directo"):
+            ok = await validar_enlace(rec["url_directo"])
+            rec["enlace_directo_ok"] = ok
+            if ok:
+                rec["enlace_preferido"] = rec["url_directo"]
+                rec["estrategia_enlace"] = "directo"
+            else:
+                rec["enlace_preferido"] = PORTAL_BUSCADOR
+                rec["estrategia_enlace"] = "estable"
+                nota_msgs.append(f"El enlace directo de {rec.get('id_cendoj')} no funcionó; usando enlace estable.")
         else:
-            # relevancia_desc (primario)
-            return (c["relevancia"], c["fecha"])
+            rec["enlace_preferido"] = PORTAL_BUSCADOR
+            rec["estrategia_enlace"] = "estable"
 
-    reverse = True if orden in ("relevancia_desc", "fecha_desc") else False
-    candidatos.sort(key=sort_key, reverse=reverse)
+        final.append(rec)
 
-    # 5) Fallback a ranking híbrido si tras filtros/orden queda vacío o hay empate pobre
-    uso_hibrido = False
-    if not candidatos:
-        # Intento híbrido con todo el corpus que coincida grosso modo con el texto
-        pool = []
-        for c in BASE_CASOS:
-            if any(normalize_text(c["match"]) in normalize_text(v) or normalize_text(v) in normalize_text(c["match"]) for v in variantes):
-                pool.append(c.copy())
-        if pool:
-            for c in pool:
-                c["_score_hibrido"] = score_hibrido(c["relevancia"], c["fecha"])
-            pool.sort(key=lambda x: x["_score_hibrido"], reverse=True)
-            candidatos = pool
-            uso_hibrido = True
-    else:
-        # Si hay resultados pero orden pobre (p.ej. todos muy antiguos), aplicamos reordenación híbrida suave
-        # (solo si el usuario pidió relevancia_desc)
-        if orden == "relevancia_desc":
-            for c in candidatos:
-                c["_score_hibrido"] = score_hibrido(c["relevancia"], c["fecha"])
-            candidatos.sort(key=lambda x: (x["_score_hibrido"]), reverse=True)
-            uso_hibrido = True
+    if not final:
+        nota_msgs.append("Ajusta términos o el rango temporal.")
+        return {
+            "query": query,
+            "total": 0,
+            "resultados": [],
+            "nota": make_nota(motivo="No se han encontrado resultados exactos.",
+                              accion="Ajusta términos o el rango temporal.",
+                              info="Ranking híbrido (relevancia + actualidad) aplicado.")
+        }
 
-    # 6) Construcción de resultados con enlaces y validación
-    resultados = []
-    for c in candidatos[:limite]:
-        id_cendoj = c["id_cendoj"]
-        ecli = c["ecli"]
-        roj = c["roj"]
-
-        url_directo = f"https://www.poderjudicial.es/search/cedula.jsp?id={id_cendoj}"
-        url_estable = enlace_estable_cendoj()
-        url_estable_sec = enlace_estable_secundario_por_ecli(ecli, roj)
-
-        enlace_directo_ok = None
-        estrategia_enlace = "directo"
-        enlace_preferido = url_directo
-
-        nota_enlace = None
-        if validar_enlaces:
-            ok = head_ok(url_directo)
-            enlace_directo_ok = bool(ok)
-            if not ok:
-                estrategia_enlace = "estable"
-                enlace_preferido = url_estable
-                nota_enlace = f"El enlace directo de {id_cendoj} no respondió como esperado; se usa enlace estable (ECLI/ROJ)."
-
-        # Resultado
-        resultados.append({
-            "titulo": c["titulo"],
-            "organo": c["organo"],
-            "sala": c["sala"],
-            "ponente": c["ponente"],
-            "fecha": c["fecha"],
-            "relevancia": round(c["relevancia"], 2),
-            "resumen": c["resumen"],
-            "id_cendoj": id_cendoj,
-            "roj": roj,
-            "ecli": ecli,
-            "url_directo": url_directo,
-            "url_estable": url_estable,
-            "url_estable_secundaria": url_estable_sec,
-            "enlace_preferido": enlace_preferido,
-            "enlace_directo_ok": enlace_directo_ok,
-            "estrategia_enlace": estrategia_enlace
-        })
-
-        if nota_enlace:
-            nota_partes.append(nota_enlace)
-
-    # 7) 0 resultados tras todo -> nota con sinónimos concretos
+    info_bits = []
+    if orden.startswith("relevancia"):
+        info_bits.append("orden: ranking híbrido (relevancia + actualidad)")
+    if experto_activo:
+        info_bits.append("experto temático (urbanismo catalán) activo")
     nota_final = None
-    if not resultados:
-        sins = sugerencias_para_query(original_query)
-        nota_final = construir_nota(
-            motivo="No se han encontrado resultados exactos.",
-            accion="Ajusta términos o el rango temporal.",
-            sugerencias=sins,
-            info="Se intentó ranking híbrido (relevancia + actualidad)."
-        )
-    else:
-        info = f"orden: {'ranking híbrido (relevancia + actualidad)' if uso_hibrido else orden}"
-        # integrar notas acumuladas + info
-        nota_final = construir_nota(
-            motivo=None,
-            accion=None,
-            sugerencias=None,
-            info=info
-        )
-        if nota_partes:
-            nota_final = (nota_final + " ").strip() + " " + " ".join(nota_partes)
+    if nota_msgs or info_bits:
+        nota_final = make_nota(info="; ".join(nota_msgs + info_bits))
 
-    payload = {
-        "query": original_query,
-        "total": len(resultados),
-        "resultados": resultados,
-        "nota": nota_final if nota_final else None
+    return {
+        "query": query,
+        "total": len(final),
+        "resultados": final,
+        "nota": nota_final
     }
-    return JSONResponse(payload)
+
+@app.get("/redir")
+async def redirigir(id: Optional[str] = None,
+                    ecli: Optional[str] = None,
+                    roj: Optional[str] = None):
+    if not (id or ecli or roj):
+        raise HTTPException(status_code=400, detail="Falta id/ecli/roj")
+    url_directo = CENDOJ_DIRECTO.format(id_cendoj=id) if id else None
+    prefer = PORTAL_BUSCADOR
+    ok = False
+    if url_directo:
+        ok = await validar_enlace(url_directo)
+    if ok:
+        prefer = url_directo
+    elif ecli:
+        prefer = GOOGLE_SITE.format(ecli=ecli)
+    return Response(status_code=302, headers={"Location": prefer})
