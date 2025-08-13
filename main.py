@@ -1,83 +1,73 @@
-import os
+# main.py — CENDOJ Action (v1.16)
+# - Sin dependencias externas: usa urllib para validar enlaces (evita ModuleNotFoundError: httpx)
+# - Mejores: normalización + sinónimos, ranking híbrido (relevancia + actualidad),
+#   resúmenes consistentes, notas explicativas, filtros temporales explícitos,
+#   enlaces híbridos (directo + estable) con validación opcional.
+
 import re
 import math
-import datetime
+import urllib.request
+from datetime import datetime, date
 from typing import List, Optional, Literal, Dict, Any
+
 from fastapi import FastAPI, Query, HTTPException
 from pydantic import BaseModel
-import httpx
 
 app = FastAPI(
     title="CENDOJ Action",
-    version="1.6",
-    description="Buscador auxiliar con normalización, sinónimos, ranking híbrido, resúmenes y validación de enlaces."
+    version="1.16",
+    description="Buscador auxiliar con normalización, sinónimos, ranking híbrido, resúmenes y validación de enlaces (sin dependencias externas)."
 )
-
-# ---------------------------
-# Utilidades básicas
-# ---------------------------
 
 DATE_FMT = "%Y-%m-%d"
 
-def to_date(s: Optional[str]) -> Optional[datetime.date]:
+# ---------------------------
+# Utilidades
+# ---------------------------
+
+def to_date(s: Optional[str]) -> Optional[date]:
     if not s:
         return None
-    return datetime.datetime.strptime(s, DATE_FMT).date()
+    return datetime.strptime(s, DATE_FMT).date()
 
-def format_date(d: datetime.date) -> str:
-    return d.strftime(DATE_FMT)
-
-def today() -> datetime.date:
-    return datetime.date.today()
-
-def clamp(v: float, lo: float = 0.0, hi: float = 1.0) -> float:
-    return max(lo, min(hi, v))
+def today() -> date:
+    return date.today()
 
 def pct_int(v: float) -> int:
-    return int(round(100 * clamp(v, 0, 1)))
-
-# ---------------------------
-# Normalización de órgano
-# ---------------------------
-
-ORG_NORMALIZATIONS = {
-    "tribunal supremo": "Tribunal Supremo (TS)",
-    "ts": "Tribunal Supremo (TS)",
-    "audiencia nacional": "Audiencia Nacional (AN)",
-    "an": "Audiencia Nacional (AN)",
-    "tsjc": "Tribunal Superior de Justicia de Cataluña (TSJC)",
-    "tribunal superior de justicia de cataluña": "Tribunal Superior de Justicia de Cataluña (TSJC)",
-}
+    v = max(0.0, min(1.0, float(v)))
+    return int(round(v * 100))
 
 def normaliza_organo(s: Optional[str]) -> Optional[str]:
     if not s:
         return None
     k = re.sub(r"\s+", " ", s.strip().lower())
-    return ORG_NORMALIZATIONS.get(k, s)
+    mapping = {
+        "tribunal supremo": "Tribunal Supremo (TS)",
+        "ts": "Tribunal Supremo (TS)",
+        "audiencia nacional": "Audiencia Nacional (AN)",
+        "an": "Audiencia Nacional (AN)",
+        "tsjc": "Tribunal Superior de Justicia de Cataluña (TSJC)",
+        "tribunal superior de justicia de cataluña": "Tribunal Superior de Justicia de Cataluña (TSJC)",
+    }
+    return mapping.get(k, s)
 
-# ---------------------------
 # Sinónimos (expansión simple)
-# ---------------------------
-
-SYNONYMS = {
+SYNONYMS: Dict[str, List[str]] = {
     "fuera de ordenación": ["situación de fuera de ordenación", "edificación disconforme", "ordenación urbanística"],
     "volumen disconforme": ["alteración de volumen", "aumento de edificabilidad", "disconformidad con planeamiento"],
     "suelo no urbanizable": ["suelo rústico", "suelos protegidos", "autorización excepcional"],
 }
 
 def expand_query(q: str) -> (str, List[str]):
-    usados = []
-    exp = [q]
+    usados: List[str] = []
     ql = q.lower()
     for base, exps in SYNONYMS.items():
         if base in ql:
             usados.extend(exps)
-            exp.extend(exps)
     return q, usados
 
 # ---------------------------
-# Dataset DEMO (mismos IDs que venías probando)
-# Nota: En producción, aquí llamarías al buscador real del CENDOJ.
+# Dataset DEMO (sustituir por fuente real si procede)
 # ---------------------------
 
 DEMO_DOCS = [
@@ -126,7 +116,7 @@ class Resultado(BaseModel):
     sala: Optional[str] = None
     ponente: Optional[str] = None
     fecha: str
-    relevancia: int  # en %
+    relevancia: int  # %
     resumen: Optional[str] = None
     id_cendoj: Optional[str] = None
     roj: Optional[str] = None
@@ -148,23 +138,23 @@ class Respuesta(BaseModel):
 # ---------------------------
 
 def make_resumen(titulo: str, organo: str, sala: Optional[str], fecha: str) -> str:
-    # Plantilla breve y neutra
-    base = re.sub(r"\s+", " ", titulo).strip().rstrip(".")
+    base = re.sub(r"\s+", " ", (titulo or "")).strip().rstrip(".")
     partes = [base]
     if organo:
         partes.append(f"({organo}{' - ' + sala if sala else ''})")
-    partes.append(f"Fecha: {fecha}.")
+    if fecha:
+        partes.append(f"Fecha: {fecha}.")
     return " ".join(partes)
 
 # ---------------------------
-# Construcción de enlaces
+# Enlaces
 # ---------------------------
 
 def enlace_directo(id_cendoj: str) -> str:
     return f"https://www.poderjudicial.es/search/cedula.jsp?id={id_cendoj}"
 
 def enlace_estable(roj: Optional[str], ecli: Optional[str]) -> str:
-    # Estrategia: búsqueda site: por ECLI preferente; si no, por ROJ
+    # Preferimos búsqueda por ECLI; si no hay, por ROJ; si no, genérica
     if ecli:
         q = f"site%3Apoderjudicial.es+%22{ecli}%22"
     elif roj:
@@ -173,77 +163,35 @@ def enlace_estable(roj: Optional[str], ecli: Optional[str]) -> str:
         q = "site%3Apoderjudicial.es+CENDOJ"
     return f"https://www.google.com/search?q={q}"
 
-async def valida_directo(url: str, timeout_s: float = 2.0) -> bool:
-    # Validación opcional y best-effort (CENDOJ puede cambiar comportamiento)
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; CendojAction/1.6)"
-    }
+def valida_directo_stdlib(url: str, timeout_s: float = 2.5) -> Optional[bool]:
+    """
+    Validación best-effort sin dependencias:
+    - Hace GET con urllib (User-Agent propio).
+    - Devuelve True si 200 y no contiene '404 Page Error'; False si >= 400 o excepción.
+    - Devuelve None si no es concluyente (dejar al llamador decidir).
+    """
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; CendojAction/1.16)"},
+        method="GET",
+    )
     try:
-        async with httpx.AsyncClient(timeout=timeout_s, headers=headers, follow_redirects=True) as client:
-            r = await client.get(url)
-            # Consideramos válido si 200 y no contiene un 404 clásico
-            if r.status_code == 200 and ("404 Page Error" not in r.text):
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            status = resp.getcode()
+            if status == 200:
+                # Leemos un pequeño fragmento para detectar la página de error
+                snippet = resp.read(2048).decode("utf-8", errors="ignore")
+                if "404 Page Error" in snippet:
+                    return False
                 return True
+            if status >= 400:
+                return False
+            return None
     except Exception:
-        pass
-    return False
+        return False
 
 # ---------------------------
-# Ranking híbrido
-# ---------------------------
-
-def score_hibrido(doc: Dict[str, Any], hoy: datetime.date) -> float:
-    # relevancia: 0..1
-    rel = float(doc.get("relevancia", 0.0))
-    # recency: 0..1 (1=reciente). Decae con media ~ 540 días
-    d = to_date(doc["fecha"])
-    if not d:
-        recency = 0.5
-    else:
-        days = (hoy - d).days
-        tau = 540.0
-        recency = math.exp(-max(0, days) / tau)  # 1 hoy, ~0.37 a 1.5 años
-    # Ponderación
-    return 0.7 * rel + 0.3 * recency
-
-def sort_docs(docs: List[Dict[str, Any]], orden: str, hoy: datetime.date) -> List[Dict[str, Any]]:
-    if orden == "relevancia_desc":
-        return sorted(docs, key=lambda d: d.get("relevancia", 0.0), reverse=True)
-    if orden == "fecha_desc":
-        return sorted(docs, key=lambda d: d.get("fecha", ""), reverse=True)
-    # default híbrido_desc
-    return sorted(docs, key=lambda d: score_hibrido(d, hoy), reverse=True)
-
-# ---------------------------
-# Filtro de fechas y órgano
-# ---------------------------
-
-def filtra_docs(docs: List[Dict[str, Any]], desde: Optional[str], hasta: Optional[str], organo: Optional[str]) -> (List[Dict[str, Any]], List[str], Optional[str]):
-    notas = []
-    d1 = to_date(desde) if desde else None
-    d2 = to_date(hasta) if hasta else None
-    if d1 and d2 and d1 > d2:
-        # corregimos rango invertido
-        d1, d2 = d2, d1
-        notas.append("Se corrigió el rango de fechas (invertido).")
-    org = normaliza_organo(organo)
-    if organo and org != organo:
-        notas.append(f"Órgano normalizado a “{org}”.")
-    out = []
-    for doc in docs:
-        ok = True
-        if org and doc["organo"] != org:
-            ok = False
-        if d1 and to_date(doc["fecha"]) < d1:
-            ok = False
-        if d2 and to_date(doc["fecha"]) > d2:
-            ok = False
-        if ok:
-            out.append(doc)
-    return out, notas, org
-
-# ---------------------------
-# Matching muy simple por texto
+# Matching y ranking
 # ---------------------------
 
 def matches(q: str, doc: Dict[str, Any]) -> bool:
@@ -252,13 +200,11 @@ def matches(q: str, doc: Dict[str, Any]) -> bool:
     return all(t in hay for t in tokens) if tokens else True
 
 def buscar_base(q: str, sinonimos: List[str]) -> (List[Dict[str, Any]], List[str]):
-    notas = []
-    candidatos = []
-    # coincidencia básica
+    notas: List[str] = []
+    candidatos: List[Dict[str, Any]] = []
     for d in DEMO_DOCS:
         if matches(q, d):
             candidatos.append(d)
-    # si nada, probar con sinónimos
     if not candidatos and sinonimos:
         notas.append("Se usaron sinónimos comunes para ampliar la coincidencia.")
         for d in DEMO_DOCS:
@@ -266,40 +212,82 @@ def buscar_base(q: str, sinonimos: List[str]) -> (List[Dict[str, Any]], List[str
                 candidatos.append(d)
     return candidatos, notas
 
+def score_hibrido(doc: Dict[str, Any], hoy: date) -> float:
+    rel = float(doc.get("relevancia", 0.0))  # 0..1
+    d = to_date(doc["fecha"])
+    if not d:
+        recency = 0.5
+    else:
+        days = (hoy - d).days
+        tau = 540.0  # ~18 meses
+        recency = math.exp(-max(0, days) / tau)  # 1 hoy; ~0.37 a ~18m
+    return 0.7 * rel + 0.3 * recency
+
+def sort_docs(docs: List[Dict[str, Any]], orden: str, hoy: date) -> List[Dict[str, Any]]:
+    if orden == "relevancia_desc":
+        return sorted(docs, key=lambda d: d.get("relevancia", 0.0), reverse=True)
+    if orden == "fecha_desc":
+        return sorted(docs, key=lambda d: d.get("fecha", ""), reverse=True)
+    # por defecto híbrido_desc
+    return sorted(docs, key=lambda d: score_hibrido(d, hoy), reverse=True)
+
+def filtra_docs(docs: List[Dict[str, Any]], desde: Optional[str], hasta: Optional[str], organo: Optional[str]):
+    notas: List[str] = []
+    d1 = to_date(desde) if desde else None
+    d2 = to_date(hasta) if hasta else None
+    if d1 and d2 and d1 > d2:
+        d1, d2 = d2, d1
+        notas.append("Se corrigió el rango de fechas (invertido).")
+    org_norm = normaliza_organo(organo)
+    if organo and org_norm != organo:
+        notas.append(f"Órgano normalizado a “{org_norm}”.")
+    out = []
+    for doc in docs:
+        ok = True
+        if org_norm and doc["organo"] != org_norm:
+            ok = False
+        if d1 and to_date(doc["fecha"]) < d1:
+            ok = False
+        if d2 and to_date(doc["fecha"]) > d2:
+            ok = False
+        if ok:
+            out.append(doc)
+    return out, notas, org_norm
+
 # ---------------------------
-# Endpoint health
+# Endpoints
 # ---------------------------
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "1.6"}
-
-# ---------------------------
-# Endpoint principal
-# ---------------------------
+    return {"status": "ok", "version": "1.16"}
 
 @app.get("/buscar-cendoj", response_model=Respuesta)
-async def buscar_cendoj(
+def buscar_cendoj(
     query: str = Query(..., description="Consulta de texto libre"),
-    organo: Optional[str] = Query(None, description="Órgano, ej. TS, TSJC, AN..."),
+    organo: Optional[str] = Query(None, description="Órgano: TS, TSJC, AN..."),
     desde: Optional[str] = Query(None, description="Fecha inicial (YYYY-MM-DD)"),
     hasta: Optional[str] = Query(None, description="Fecha final (YYYY-MM-DD)"),
     orden: Optional[str] = Query("hibrido_desc", description="hibrido_desc | relevancia_desc | fecha_desc"),
-    limite: Optional[int] = Query(5, ge=1, le=50, description="Límite de resultados"),
-    validar_enlaces: Optional[bool] = Query(False, description="Validar enlace directo contra CENDOJ"),
+    limite: Optional[int] = Query(5, ge=1, le=50, description="Nº máximo de resultados"),
+    validar_enlaces: Optional[bool] = Query(False, description="Validar el enlace directo contra CENDOJ"),
 ):
-    # Normalización de query + expansión de sinónimos
-    q_limpia = re.sub(r"[“”\"']", "", query).strip()
+    # Limpieza simple de la query
+    q_limpia = re.sub(r"[“”\"']", "", query or "").strip()
+    if not q_limpia:
+        raise HTTPException(status_code=400, detail="La consulta no puede estar vacía.")
+
+    # Expansión de sinónimos
     q_base, sinonimos_usados = expand_query(q_limpia)
 
-    # Búsqueda base (demo)
+    # Búsqueda base (sobre DEMO)
     docs, notas_busqueda = buscar_base(q_base, sinonimos_usados)
 
-    # Filtro por fechas/órgano
+    # Filtros
     try:
-        docs, notas_filtros, organo_norm = filtra_docs(docs, desde, hasta, organo)
+        docs, notas_filtros, org_norm = filtra_docs(docs, desde, hasta, organo)
     except ValueError:
-        raise HTTPException(status_code=400, detail="El rango de fechas es inválido: 'desde' y/o 'hasta' no cumplen YYYY-MM-DD.")
+        raise HTTPException(status_code=400, detail="Rango de fechas inválido. Usa YYYY-MM-DD.")
 
     # Ordenación
     docs = sort_docs(docs, orden or "hibrido_desc", today())
@@ -315,24 +303,19 @@ async def buscar_cendoj(
     for d in docs:
         url_dir = enlace_directo(d["id_cendoj"])
         url_est = enlace_estable(d.get("roj"), d.get("ecli"))
-        ok_dir: Optional[bool] = None
+
         estrategia = "directo"
         preferido = url_dir
+        ok_dir: Optional[bool] = None
 
-        # Validación de enlace directo si se solicita
         if validar_enlaces:
-            ok_dir = await valida_directo(url_dir)
-            if not ok_dir:
+            ok_dir = valida_directo_stdlib(url_dir)
+            if ok_dir is False:
                 estrategia = "estable"
                 preferido = url_est
-                notas.append(f"El enlace directo de {d['id_cendoj']} no respondió como esperado; se ofrece enlace estable por ECLI/ROJ.")
+                notas.append(f"El enlace directo de {d['id_cendoj']} no respondió como esperado; se usa enlace estable (ECLI/ROJ).")
 
-        resumen = make_resumen(
-            titulo=d["titulo"],
-            organo=d["organo"],
-            sala=d.get("sala"),
-            fecha=d["fecha"]
-        )
+        resumen = make_resumen(d["titulo"], d["organo"], d.get("sala"), d["fecha"])
 
         resultados.append(Resultado(
             titulo=d["titulo"],
@@ -349,18 +332,18 @@ async def buscar_cendoj(
             url_estable=url_est,
             enlace_preferido=preferido,
             enlace_directo_ok=ok_dir,
-            estrategia_enlace=estrategia,  # directo|estable
+            estrategia_enlace=estrategia,
         ))
 
-    # Notas explicativas más precisas
+    # Nota final
     if not resultados:
         nota_final = "No se han encontrado resultados exactos. Prueba con sinónimos o ajusta el rango de fechas."
     else:
         extras = []
         if sinonimos_usados:
             extras.append("sinónimos: " + ", ".join(sinonimos_usados))
-        if orden == "hibrido_desc":
-            extras.append("orden: ranking híbrido (relevancia y actualidad)")
+        if (orden or "hibrido_desc") == "hibrido_desc":
+            extras.append("orden: ranking híbrido (relevancia + actualidad)")
         if extras:
             notas.append("Info: " + "; ".join(extras))
         nota_final = "; ".join(notas) if notas else None
